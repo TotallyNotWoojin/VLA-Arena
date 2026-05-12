@@ -16,6 +16,7 @@
 Evaluates a pretrained SmolVLA policy on the VLA-Arena benchmark.
 """
 
+import contextlib
 import json
 import logging
 import math
@@ -33,6 +34,7 @@ import numpy as np
 import torch
 import tqdm
 import wandb
+from vla_arena.profiler_utils import build_profiler
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 from lerobot.utils.utils import init_logging
 
@@ -121,6 +123,10 @@ class Args:
     """Video saving mode: 'all', 'first_success_failure', 'none'."""
 
     result_json_path: str | None = None
+
+    profiler_enabled: bool = True
+    profiler_output_dir: str = './experiments/profiler'
+    profiler_profile_memory: bool = False
 
     #################################################################################################################
     # Instruction replacement parameters
@@ -225,6 +231,7 @@ def run_episode(
     max_steps: int,
     initial_state=None,
     log_file=None,
+    profiler=None,
 ):
     """Run a single episode in the environment."""
     env.reset()
@@ -297,6 +304,8 @@ def run_episode(
             with torch.inference_mode():
                 action_tensor = policy.select_action(observation)
             action = action_tensor.cpu().numpy()[0]
+            if profiler is not None:
+                profiler.step()
 
             obs, _, done, info = env.step(action)
 
@@ -336,6 +345,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    profiler=None,
 ):
     """Run evaluation for a single task."""
     task = task_suite.get_task_by_level_id(task_level, task_id)
@@ -422,6 +432,7 @@ def run_task(
             max_steps,
             initial_state,
             log_file,
+            profiler,
         )
         if cost is not None:
             log_message(f'Episode finished with cost {cost}', log_file)
@@ -621,6 +632,11 @@ def main(cfg: Args | str | Path):
 
     replacements_dict = load_replacements_dict(args, logger)
 
+    prof = build_profiler(args)
+    if prof is not None:
+        logger.info(f'Torch profiler enabled — traces → {args.profiler_output_dir}')
+        prof.__enter__()
+
     for suite_name in suite_names:
         if suite_name not in benchmark_dict:
             raise ValueError(
@@ -677,6 +693,7 @@ def main(cfg: Args | str | Path):
                 total_episodes,
                 total_successes,
                 log_file,
+                prof,
             )
             total_episodes += task_episodes
             total_successes += task_successes
@@ -730,6 +747,9 @@ def main(cfg: Args | str | Path):
                 'numSuccesses': total_successes,
             }
         )
+
+    if prof is not None:
+        prof.__exit__(None, None, None)
 
     if args.result_json_path is None or str(args.result_json_path).lower() == 'default':
         result_dir = Path('./results')

@@ -5,6 +5,7 @@ Uses the shared multi-suite flow and emits JSON metrics.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -18,6 +19,7 @@ import numpy as np
 import tqdm
 import yaml
 
+from vla_arena.profiler_utils import build_profiler
 from vla_arena.vla_arena import benchmark, get_vla_arena_path
 from vla_arena.vla_arena.envs import OffScreenRenderEnv
 from vla_arena.vla_arena.utils.eval_init_state import select_init_state_index
@@ -64,6 +66,10 @@ class EvaluatorConfig:
     wandb_project: str = 'your-wandb-project'
 
     result_json_path: str | None = None
+
+    profiler_enabled: bool = True
+    profiler_output_dir: str = './experiments/profiler'
+    profiler_profile_memory: bool = False
 
 
 # Hooks
@@ -187,6 +193,7 @@ def run_episode(
     rng: np.random.Generator,
     initial_state=None,
     log_file=None,
+    profiler=None,
 ):
     env.reset()
     if initial_state is not None:
@@ -210,6 +217,8 @@ def run_episode(
         frames.append(frame)
 
         action = get_action(cfg, rng, observation, task_description)
+        if profiler is not None:
+            profiler.step()
         action = process_action(action)
 
         obs, _, done, info = env.step(action)
@@ -241,6 +250,7 @@ def run_task(
     total_episodes: int,
     total_successes: int,
     log_file=None,
+    profiler=None,
 ):
     task = task_suite.get_task_by_level_id(task_level, task_id)
     initial_states, _ = load_initial_states(cfg, task_suite, task_id, task_level, log_file)
@@ -274,7 +284,7 @@ def run_task(
             if initial_state_idx is not None
             else None
         )
-        success, frames, cost = run_episode(cfg, env, task_description, rng, initial_state, log_file)
+        success, frames, cost = run_episode(cfg, env, task_description, rng, initial_state, log_file, profiler)
 
         task_episodes += 1
         total_episodes += 1
@@ -359,6 +369,11 @@ def main(cfg: EvaluatorConfig | str | pathlib.Path | None = None):
 
     tasks_payload: list[dict[str, object]] = []
 
+    prof = build_profiler(cfg)
+    if prof is not None:
+        logger.info(f'Torch profiler enabled — traces → {cfg.profiler_output_dir}')
+        prof.__enter__()
+
     for suite_name in suite_names:
         task_suite = benchmark_dict[suite_name]()
         task_level = cfg.task_level
@@ -383,6 +398,7 @@ def main(cfg: EvaluatorConfig | str | pathlib.Path | None = None):
                 total_episodes,
                 total_successes,
                 log_file,
+                prof,
             )
             grand_costs += total_costs
 
@@ -410,6 +426,9 @@ def main(cfg: EvaluatorConfig | str | pathlib.Path | None = None):
                 'numSuccesses': total_successes,
             }
         )
+
+    if prof is not None:
+        prof.__exit__(None, None, None)
 
     if cfg.result_json_path is None or str(cfg.result_json_path).lower() == 'default':
         result_dir = pathlib.Path('./results')

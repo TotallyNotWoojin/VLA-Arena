@@ -18,6 +18,7 @@ run_vla_arena_eval.py
 Evaluates a trained policy in a VLA-Arena simulation benchmark task suite.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ import numpy as np
 import tqdm
 import wandb
 
+from vla_arena.profiler_utils import build_profiler
 from vla_arena.models.openvla.experiments.robot.vla_arena.vla_arena_utils import (
     get_vla_arena_dummy_action,
     get_vla_arena_env,
@@ -122,6 +124,10 @@ class GenerateConfig:
     save_video_mode: str = 'first_success_failure'   # Video saving mode: "all", "first_success_failure", "none"
 
     result_json_path: str | None = None
+
+    profiler_enabled: bool = True
+    profiler_output_dir: str = './experiments/profiler'
+    profiler_profile_memory: bool = False
 
     # fmt: on
 
@@ -299,6 +305,7 @@ def run_episode(
     processor=None,
     initial_state=None,
     log_file=None,
+    profiler=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -348,6 +355,8 @@ def run_episode(
                 task_description,
                 processor=processor,
             )
+            if profiler is not None:
+                profiler.step()
 
             # Process action
             action = process_action(action, cfg.model_family)
@@ -391,6 +400,7 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    profiler=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -488,6 +498,7 @@ def run_task(
             processor,
             initial_state,
             log_file,
+            profiler,
         )
         if cost is not None:
             log_message(f'Episode finished with cost {cost}', log_file)
@@ -637,6 +648,11 @@ def main(cfg: GenerateConfig | str | Path):
 
     replacements_dict = load_replacements_dict(cfg, logger)
 
+    prof = build_profiler(cfg)
+    if prof is not None:
+        logger.info(f'Torch profiler enabled — traces → {cfg.profiler_output_dir}')
+        prof.__enter__()
+
     for suite_name in suite_names:
         if suite_name not in benchmark_dict:
             raise ValueError(
@@ -691,6 +707,7 @@ def main(cfg: GenerateConfig | str | Path):
                 total_episodes,
                 total_successes,
                 log_file,
+                prof,
             )
             total_episodes += task_episodes
             total_successes += task_successes
@@ -744,6 +761,9 @@ def main(cfg: GenerateConfig | str | Path):
                 'numSuccesses': total_successes,
             }
         )
+
+    if prof is not None:
+        prof.__exit__(None, None, None)
 
     if cfg.result_json_path is None or str(cfg.result_json_path).lower() == 'default':
         result_dir = Path('./results')
