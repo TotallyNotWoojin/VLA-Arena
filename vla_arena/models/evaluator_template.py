@@ -7,6 +7,7 @@ fill in the model-specific parts, and run via:
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
@@ -66,6 +67,61 @@ class EvaluatorConfig:
 
     # Output
     result_json_path: str | None = None
+
+    # Torch profiler — off by default; opt-in per-run
+    profiler_enabled: bool = True
+    profiler_output_dir: str = './experiments/profiler'
+    # Enabling memory profiling adds significant overhead; leave off unless needed
+    profiler_profile_memory: bool = False
+
+
+def _build_profiler(cfg: EvaluatorConfig):
+    """Return a torch profiler, or None when profiling is disabled.
+
+    Covers the entire run with ~98% step coverage while keeping RAM bounded.
+    Schedule: wait=0 + warmup=1 + active=50, repeat=0 (runs forever).
+    Every 51 inference steps the active window closes, flushes a trace file to
+    disk, and immediately opens the next window — only the 1 warmup step per
+    cycle is not recorded.
+
+    Overhead: ~2–5% slower inference throughput while profiling is active.
+    Increase active= if you want fewer, larger trace files.
+
+    View results with:
+        tensorboard --logdir <profiler_output_dir>
+    """
+    if not cfg.profiler_enabled:
+        return None
+
+    try:
+        import torch
+        from torch.profiler import (
+            ProfilerActivity,
+            profile,
+            schedule,
+            tensorboard_trace_handler,
+        )
+    except ImportError:
+        logger.warning('torch not available — profiler disabled')
+        return None
+
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
+    output_dir = pathlib.Path(cfg.profiler_output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    return profile(
+        activities=activities,
+        # Flush every 50 active steps so in-memory trace data stays bounded.
+        # wait=0 + warmup=1 + active=50 → ~98% step coverage with repeat=0 (no end).
+        schedule=schedule(skip_first=0, wait=0, warmup=1, active=50, repeat=0),
+        on_trace_ready=tensorboard_trace_handler(str(output_dir), use_gzip=True),
+        record_shapes=False,
+        profile_memory=cfg.profiler_profile_memory,
+        with_stack=False,
+    )
 
 
 # Hooks to implement per-model
@@ -189,6 +245,7 @@ def run_episode(
     model: Any,
     initial_state=None,
     log_file=None,
+    profiler=None,
 ):
     env.reset()
     if initial_state is not None:
@@ -212,6 +269,8 @@ def run_episode(
         frames.append(frame)
 
         action = get_action(cfg, model, observation, task_description)
+        if profiler is not None:
+            profiler.step()
         action = process_action(action)
 
         obs, _, done, info = env.step(action)
@@ -243,6 +302,7 @@ def run_task(
     total_episodes: int,
     total_successes: int,
     log_file=None,
+    profiler=None,
 ):
     task = task_suite.get_task_by_level_id(task_level, task_id)
     initial_states, _ = load_initial_states(cfg, task_suite, task_id, task_level, log_file)
@@ -279,7 +339,7 @@ def run_task(
             if initial_state_idx is not None
             else None
         )
-        success, frames, cost = run_episode(cfg, env, task_description, model, initial_state, log_file)
+        success, frames, cost = run_episode(cfg, env, task_description, model, initial_state, log_file, profiler)
 
         task_episodes += 1
         total_episodes += 1
@@ -347,6 +407,10 @@ def main(cfg: EvaluatorConfig | str | pathlib.Path | None = None):
     log_file, log_path, run_id = setup_logging(cfg)
     log_message(f'Loaded model {cfg.model_name}', log_file)
 
+    prof = _build_profiler(cfg)
+    if prof is not None:
+        log_message(f'Torch profiler enabled — traces → {cfg.profiler_output_dir}', log_file)
+
     benchmark_dict = benchmark.get_benchmark_dict()
 
     # Support single suite or multiple suites in one run
@@ -363,68 +427,70 @@ def main(cfg: EvaluatorConfig | str | pathlib.Path | None = None):
 
     tasks_payload: list[dict[str, object]] = []
 
-    for suite_name in suite_names:
-        task_suite = benchmark_dict[suite_name]()
-        task_level = cfg.task_level
-        num_tasks = 10 if suite_name == 'long_horizon' and task_level == 0 else 5
+    with (prof if prof is not None else contextlib.nullcontext()):
+        for suite_name in suite_names:
+            task_suite = benchmark_dict[suite_name]()
+            task_level = cfg.task_level
+            num_tasks = 10 if suite_name == 'long_horizon' and task_level == 0 else 5
 
-        total_episodes = 0
-        total_successes = 0
-        grand_costs = 0
-        for task_id in range(num_tasks):
-            (
-                task_episodes,
-                task_successes,
-                total_costs,
-                success_costs,
-                failure_costs,
-                total_episodes,
-                total_successes,
-            ) = run_task(
-                cfg,
-                task_suite,
-                task_id,
-                task_level,
-                model,
-                total_episodes,
-                total_successes,
-                log_file,
-            )
-            grand_costs += total_costs
+            total_episodes = 0
+            total_successes = 0
+            grand_costs = 0
+            for task_id in range(num_tasks):
+                (
+                    task_episodes,
+                    task_successes,
+                    total_costs,
+                    success_costs,
+                    failure_costs,
+                    total_episodes,
+                    total_successes,
+                ) = run_task(
+                    cfg,
+                    task_suite,
+                    task_id,
+                    task_level,
+                    model,
+                    total_episodes,
+                    total_successes,
+                    log_file,
+                    prof,
+                )
+                grand_costs += total_costs
 
-        final_success_rate = total_successes / total_episodes if total_episodes else 0.0
-        average_cost = grand_costs / total_episodes if total_episodes else 0.0
-        log_message(f'[{suite_name}] success rate: {final_success_rate:.3f}', log_file)
-        log_message(f'[{suite_name}] average cost: {average_cost:.3f}', log_file)
+            final_success_rate = total_successes / total_episodes if total_episodes else 0.0
+            average_cost = grand_costs / total_episodes if total_episodes else 0.0
+            log_message(f'[{suite_name}] success rate: {final_success_rate:.3f}', log_file)
+            log_message(f'[{suite_name}] average cost: {average_cost:.3f}', log_file)
 
-        category, has_cc = _suite_category(suite_name)
+            category, has_cc = _suite_category(suite_name)
 
-        sr = [0.0, 0.0, 0.0]
-        cc = [0.0, 0.0, 0.0]
-        sr[task_level] = final_success_rate
-        cc[task_level] = average_cost if has_cc else 0.0
+            sr = [0.0, 0.0, 0.0]
+            cc = [0.0, 0.0, 0.0]
+            sr[task_level] = final_success_rate
+            cc[task_level] = average_cost if has_cc else 0.0
 
-        tasks_payload.append(
-            {
-                'name': suite_name,
-                'category': category,
-                'hasCC': has_cc,
-                'data': {'sr': sr, 'cc': cc},
-                'numEpisodes': total_episodes,
-                'numSuccesses': total_successes,
-            }
-        )
-
-        if cfg.use_wandb:
-            import wandb
-
-            wandb.log(
+            tasks_payload.append(
                 {
-                    f'success_rate/{suite_name}': final_success_rate,
-                    f'num_episodes/{suite_name}': total_episodes,
-                    f'costs/{suite_name}': average_cost,
+                    'name': suite_name,
+                    'category': category,
+                    'hasCC': has_cc,
+                    'data': {'sr': sr, 'cc': cc},
+                    'numEpisodes': total_episodes,
+                    'numSuccesses': total_successes,
                 }
             )
+
+            if cfg.use_wandb:
+                import wandb
+
+                wandb.log(
+                    {
+                        f'success_rate/{suite_name}': final_success_rate,
+                        f'num_episodes/{suite_name}': total_episodes,
+                        f'costs/{suite_name}': average_cost,
+                    }
+                )
 
     # Persist JSON results if requested
     if cfg.result_json_path is not None:
