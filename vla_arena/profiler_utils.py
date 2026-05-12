@@ -12,9 +12,9 @@ def build_profiler(cfg: Any):
 
     cfg must expose: profiler_enabled, profiler_output_dir, profiler_profile_memory.
 
-    Uses a continuous schedule (wait=0, warmup=1, active=50, repeat=0) that
-    flushes a gzip-compressed TensorBoard trace to disk every 50 inference steps,
-    keeping in-memory trace data bounded while covering the entire run.
+    Uses a schedule (skip_first=10, wait=5, warmup=2, active=10, repeat=3) that
+    captures three representative 10-step windows near the start of the run,
+    then goes silent — bounding both memory and overhead for the rest of the run.
 
     View results:
         tensorboard --logdir <profiler_output_dir>
@@ -45,7 +45,7 @@ def build_profiler(cfg: Any):
 
     return profile(
         activities=activities,
-        schedule=schedule(skip_first=0, wait=0, warmup=1, active=50, repeat=0),
+        schedule=schedule(skip_first=10, wait=5, warmup=2, active=10, repeat=3),
         on_trace_ready=tensorboard_trace_handler(str(output_dir), use_gzip=True),
         record_shapes=False,
         profile_memory=getattr(cfg, 'profiler_profile_memory', False),
