@@ -67,7 +67,7 @@ class EvaluatorConfig:
 
     result_json_path: str | None = None
 
-    profiler_enabled: bool = True
+    profiler_enabled: bool = False
     profiler_output_dir: str = './experiments/profiler'
     profiler_profile_memory: bool = False
 
